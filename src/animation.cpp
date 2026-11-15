@@ -17,6 +17,8 @@ extern player_anim_params_s player_params[MAX_CLIENTS];
 int player = -1;
 edict_t* m_pCurrentEntity;
 extern qboolean nofind;
+// Arabian Servers fix 3: true for players rebuilt for the current shooter in this think
+extern bool player_valid[MAX_CLIENTS];
 
 int VectorCompare(const vec_t* v1, const vec_t* v2)
 {
@@ -703,20 +705,22 @@ real_t StudioEstimateFrame(float frame, mstudioseqdesc_t* pseqdesc)
 }
 
 
-float StudioEstimateFrame(mstudioseqdesc_t* pseqdesc)
+// Arabian Servers fix 1: this used the global `player` (whichever player had bones set up last)
+// instead of the player being processed, so the frame came from another player's data.
+float StudioEstimateFrame(mstudioseqdesc_t* pseqdesc, const player_anim_params_s& p)
 {
 	double dfdt, f;
 
 
 	if (1)
 	{
-		if (player_params[player].m_clTime < player_params[player].animtime)
+		if (p.m_clTime < p.animtime)
 		{
 			dfdt = 0;
 		}
 		else
 		{
-			dfdt = (player_params[player].m_clTime - player_params[player].animtime) * player_params[player].framerate * pseqdesc->fps;
+			dfdt = (p.m_clTime - p.animtime) * p.framerate * pseqdesc->fps;
 		}
 	}
 	else
@@ -730,7 +734,7 @@ float StudioEstimateFrame(mstudioseqdesc_t* pseqdesc)
 	}
 	else
 	{
-		f = (player_params[player].frame * (pseqdesc->numframes - 1)) / 256.0;
+		f = (p.frame * (pseqdesc->numframes - 1)) / 256.0;
 	}
 
 	f += dfdt;
@@ -858,6 +862,13 @@ void EXT_FUNC HL_StudioSetupBones(model_t* pModel, float frame, int sequence, co
 	vec3_t temp_angles;
 	vec3_t temp_origin;
 	if (!phf_hitbox_fix->value || nofind)
+	{
+		orig_interface.SV_StudioSetupBones(pModel, frame, sequence, angles, origin, pcontroller, pblending, iBone, pEdict);
+		return;
+	}
+
+	// Arabian Servers fix 3 (HL path): players not rebuilt for this shooter use the original bones
+	if (ENTINDEX(pEdict) >= 1 && ENTINDEX(pEdict) <= api->GetMaxClients() && !player_valid[ENTINDEX(pEdict) - 1])
 	{
 		orig_interface.SV_StudioSetupBones(pModel, frame, sequence, angles, origin, pcontroller, pblending, iBone, pEdict);
 		return;
@@ -1085,7 +1096,7 @@ void CS_StudioProcessParams(int player, player_anim_params_s& params)
 	params.m_nPlayerGaitSequences = params.gaitsequence;
 	
 
-	params.f = StudioEstimateFrame(pseqdesc);
+	params.f = StudioEstimateFrame(pseqdesc, params);
 
 
 	if (params.gaitsequence == ANIM_WALK_SEQUENCE)
@@ -1133,7 +1144,7 @@ void EXT_FUNC CS_StudioSetupBones(model_t* pModel, float frame, int sequence, co
 		return;
 	}
 	auto entId = ENTINDEX(pEdict);
-	if (entId > 0 && entId <= api->GetMaxClients())
+	if (entId > 0 && entId <= api->GetMaxClients() && player_valid[entId - 1])
 	{
 		player = entId - 1;
 		sequence = player_params[player].sequence;

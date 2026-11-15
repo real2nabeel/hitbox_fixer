@@ -9,6 +9,7 @@
 cvar_t* sv_unlag;
 cvar_t* sv_maxunlag;
 cvar_t* sv_unlagpush;
+cvar_t* sv_maxvelocity; // Arabian Servers fix 4: teleport check
 cvar_t hf_hitbox_fix = { "hbf_enabled", "1", FCVAR_SERVER | FCVAR_PROTECTED, 1.0f, NULL };
 cvar_t hf_debug = { "hbf_debug", "0", FCVAR_SERVER | FCVAR_PROTECTED, 0.0f, NULL };
 cvar_t* phf_debug;
@@ -42,6 +43,9 @@ constexpr int SV_UPDATE_MASK = (SV_UPDATE_BACKUP - 1);
 
 uint32_t ServerFrameId;
 player_anim_params_s player_params[MAX_CLIENTS]{};
+// Arabian Servers fix 3: player_params[i] is only valid for the current shooter when it was
+// rebuilt in that shooter's PreThink; others hold another shooter's view and must not be used.
+bool player_valid[MAX_CLIENTS]{};
 
 
 void InterpolateAngles(vec3_t start, vec3_t end, vec3_t& output, float frac);
@@ -95,7 +99,7 @@ float MSG_ReadAngleFromDelta(float baseAngle, int numbits, uint32_t& bitstream, 
   int deltaBits = MSG_ReadBits(numbits, bitstream, bitPos);
   float deltaAngle = deltaBits * (360.0f / (1 << numbits));
 
-  // Âîññòàíîâèòü èòîãîâûé óãîë
+  // Ã‚Ã®Ã±Ã±Ã²Ã Ã­Ã®Ã¢Ã¨Ã²Ã¼ Ã¨Ã²Ã®Ã£Ã®Ã¢Ã»Ã© Ã³Ã£Ã®Ã«
   float resultAngle = baseAngle + deltaAngle;
 
   if (resultAngle >= 360.0f)
@@ -128,6 +132,12 @@ public:
   player_anim_params_s processed_params[32];
   float lastTimeReceived{};
   uint32_t last_proccesed_seq = 0;
+  // Arabian Servers fix 4: the client resets a player's interpolation when he comes back into its
+  // updates after a gap, or jumps further than one update can move him (teleport, respawn).
+  // History from before such a point must not be used.
+  uint32_t last_sent[32]{};
+  uint32_t reset_seq[32]{};
+  uint32_t applied_reset[32]{};
   void add_history(int id, uint32_t out_seq, entity_state_t* state)
   {
     player_ent_hist_params_s params;
@@ -153,6 +163,25 @@ public:
     params.blending[0] = state->blending[0];
     params.blending[1] = state->blending[1];
 
+    // Arabian Servers fix 4: detect a gap (not sent in the previous packet) or a teleport
+    bool reset = last_sent[id] == 0 || out_seq - last_sent[id] > 1;
+    if (!reset)
+    {
+      auto& [prev_seq, prev] = history[id][(out_seq - 1) % k_MaxHistory];
+      if (prev_seq == out_seq - 1)
+      {
+        vec3_t delta;
+        VectorSubtract(params.origin, prev.origin, delta);
+        float maxvel = (sv_maxvelocity && sv_maxvelocity->value > 0.0f) ? sv_maxvelocity->value : 2000.0f;
+        // same limit the client uses: maxvelocity * (1 / 20 fps)
+        if (sqrtf(delta[0] * delta[0] + delta[1] * delta[1] + delta[2] * delta[2]) > maxvel * (1.0f / 20.0f))
+          reset = true;
+      }
+    }
+    if (reset)
+      reset_seq[id] = out_seq;
+    last_sent[id] = out_seq;
+
     history[id][out_seq % k_MaxHistory] = { out_seq, params };
   }
   bool process_anims(int id, uint32_t last_out, uint32_t recv_seq, double lerp, double frametime, player_anim_params_s& params)
@@ -165,11 +194,12 @@ public:
     auto processed = false;
     player_ent_hist_params_s* to_lerp = nullptr;
     size_t end = (last_out) % k_MaxHistory;
+    const uint32_t min_seq = reset_seq[id]; // Arabian Servers fix 4: ignore history before a reset
     for (size_t i = (last_out + 1) % k_MaxHistory; i != end; i = (i + 1) % k_MaxHistory)
     {
       auto& [seq, hist] = history[id][i];
 
-      if (seq >= recv_seq)
+      if (seq >= recv_seq && seq >= min_seq)
       {
         to_lerp = &hist;
         break;
@@ -187,6 +217,11 @@ public:
     {
       auto& [seq, hist] = history[id][i];
 
+      if (seq < min_seq) // Arabian Servers fix 4
+      {
+        continue;
+      }
+
       if ((hist.animtime) <= target_time)
       {
         if (!from_lerp || hist.animtime > from_lerp->animtime)
@@ -198,7 +233,34 @@ public:
         continue;
       }
       processed = true;
-      params.sequence = hist.sequence ;
+
+      int new_sequence = hist.sequence < 0 ? 0 : hist.sequence;
+
+      // Arabian Servers fix 4: first update after a reset, drop the latched state like the client does
+      if (applied_reset[id] != min_seq)
+      {
+        applied_reset[id] = min_seq;
+        params.sequence = new_sequence;
+        params.prevsequence = new_sequence;
+        params.sequencetime = 0;
+        params.prevframe = 0;
+        params.m_prevgaitorigin = hist.origin;
+        params.m_clTime = hist.animtime;
+      }
+
+      // Arabian Servers fix 2: on a sequence change keep the OLD sequence and its last frame,
+      // so the 0.2 s transition blends from the previous pose (was: prevsequence = new sequence,
+      // prevframe never kept, so the hitbox snapped to the new pose).
+      if (new_sequence != params.sequence)
+      {
+        params.prevsequence = params.sequence;
+        params.prevframe = float(params.f);
+        params.sequencetime = hist.animtime + 0.01f;
+        for (int b = 0; b < 2; b++)
+          params.prevseqblending[b] = params.blending[b];
+      }
+
+      params.sequence = new_sequence;
       params.gaitsequence = hist.gaitsequence;
       params.frame = uint32_t(hist.frame);
 
@@ -215,20 +277,6 @@ public:
 
       params.animtime = hist.animtime;
       params.framerate = hist.framerate;
-
-      if (params.sequence < 0)
-        params.sequence = 0;
-
-      // sequence has changed, hold the previous sequence info
-      if (params.sequence != params.prevsequence)
-      {
-        params.sequencetime = params.animtime + 0.01f;
-
-        // save current blends to right lerping from last sequence
-        for (int i = 0; i < 2; i++)
-          params.prevseqblending[i] = params.blending[i];
-        params.prevsequence = params.sequence; // save old sequence	
-      }
 
       // copy controllers
       for (int i = 0; i < 4; i++)
@@ -366,6 +414,8 @@ void (PlayerPreThinkPre)(edict_t* pEntity)
     RETURN_META(MRES_IGNORED);
 
   nofind = 0;
+  for (int v = 0; v < MAX_CLIENTS; v++) // Arabian Servers fix 3: nothing is valid until rebuilt for this shooter
+    player_valid[v] = false;
 
   size_t frame_index = SV_UPDATE_MASK & (_host_client->netchan.incoming_acknowledged);
   frame = &_host_client->frames[frame_index];
@@ -407,9 +457,10 @@ void (PlayerPreThinkPre)(edict_t* pEntity)
     auto client_id = state->number - 1;
 
 
-    PlayerAnimProcessor[host_id].process_anims(client_id, _host_client->netchan.outgoing_sequence, _host_client->netchan.incoming_acknowledged, cl_interptime, dt, PlayerAnimProcessor[host_id].processed_params[client_id]);
+    bool processed = PlayerAnimProcessor[host_id].process_anims(client_id, _host_client->netchan.outgoing_sequence, _host_client->netchan.incoming_acknowledged, cl_interptime, dt, PlayerAnimProcessor[host_id].processed_params[client_id]);
     UpdateClientAnimParams(client_id, host_id, PlayerAnimProcessor[host_id].processed_params[client_id], dt);
     player_params[client_id] = PlayerAnimProcessor[host_id].processed_params[client_id];
+    player_valid[client_id] = processed; // Arabian Servers fix 3
 
 
   }
@@ -947,6 +998,17 @@ int	(AddToFullPackPost)(struct entity_state_s* state, int e, edict_t* ent, edict
     RETURN_META_VALUE(MRES_IGNORED, 0);
   }
   auto id = ENTINDEX(ent) - 1;
+
+  // Arabian Servers fix 4: only record what was actually sent to this client. The post hook also
+  // runs when AddToFullPack returned 0 (not sent), and then `state` was never filled in.
+  int sent = META_RESULT_ORIG_RET(int);
+  if (META_RESULT_STATUS >= MRES_OVERRIDE)
+    sent = META_RESULT_OVERRIDE_RET(int);
+  if (!sent)
+  {
+    RETURN_META_VALUE(MRES_IGNORED, 0);
+  }
+
   PlayerAnimProcessor[host_id].add_history(id, _host_client->netchan.outgoing_sequence, state);
 
   RETURN_META_VALUE(MRES_IGNORED, 0);
@@ -1147,7 +1209,10 @@ void (SendDebugInfo)(size_t player_index)
     }
     auto model = api->GetModel(dst_plr->edict->v.modelindex);
 
-    player_params[player_index] = PlayerAnimProcessor[player_index].processed_params[i];
+    // Arabian Servers fix 5: was player_params[player_index] (the viewer's own slot), so the bones
+    // below were set up from whatever player_params[i] held
+    player_params[i] = PlayerAnimProcessor[player_index].processed_params[i];
+    player_valid[i] = true;
     size_t numbones = 0;
     if (full_info)
     {
@@ -1231,6 +1296,7 @@ bool OnMetaAttach()
   sv_unlag = g_engfuncs.pfnCVarGetPointer("sv_unlag");
   sv_maxunlag = g_engfuncs.pfnCVarGetPointer("sv_maxunlag");
   sv_unlagpush = g_engfuncs.pfnCVarGetPointer("sv_unlagpush");
+  sv_maxvelocity = g_engfuncs.pfnCVarGetPointer("sv_maxvelocity");
 
 
   CVAR_REGISTER(&hf_hitbox_fix);
